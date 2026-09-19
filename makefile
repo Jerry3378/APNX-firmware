@@ -41,6 +41,3 @@ include $(DMBS_PATH)/gcc.mk
 include $(DMBS_PATH)/hid.mk
 include $(DMBS_PATH)/avrdude.mk
 include $(DMBS_PATH)/atprogram.mk
-
-# Local git helper (untracked) — optional
--include git.mk

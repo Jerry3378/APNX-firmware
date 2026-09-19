@@ -15,8 +15,3 @@ build/
 *~
 *.swp
 .DS_Store
-
-# Local git helper — not tracked
-git.mk
-Makefile.git
-*.local.mk
