@@ -1,0 +1,22 @@
+# APNX_firmware .gitignore — 펌웨어 별도 git
+# hex는 verbatim이므로 예외로 커밋 (빌드 산출물 중 hex만 허용)
+*.elf
+!APNX_firmware.hex
+*.bin
+*.eep
+*.lss
+*.map
+*.sym
+*.o
+*.d
+obj/
+build/
+*.a
+*~
+*.swp
+.DS_Store
+
+# Local git helper — not tracked
+git.mk
+Makefile.git
+*.local.mk
