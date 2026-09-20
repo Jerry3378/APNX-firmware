@@ -596,23 +596,25 @@ This provides a controlled software path from the application firmware to the bo
 ## Project Structure
 
 ```text
-apnx-firmware/
-│
-├── src/
-│   ├── main.c
-│   └── ...
-│
-├── LUFA/
-│   └── ...
-│
-├── docs/
-│   ├── protocol.md
-│   └── memory-map.md
-│
-├── APNX-Firmware.hex
-├── Makefile
+APNX-firmware/
+├── Config/
+│   └── LUFAConfig.h
+├── APNX_firmware.c
+├── APNX_firmware.hex
+├── BulkVendor.h
+├── Descriptors.c
+├── Descriptors.h
+├── makefile
+├── .gitignore
 └── README.md
 ```
+
+- APNX_firmware.c — APNX firmware application logic
+- BulkVendor.h — LUFA USB Bulk Vendor interface configuration
+- Descriptors.c/h — USB device descriptors
+- Config/LUFAConfig.h — LUFA configuration
+- makefile — AVR firmware build configuration
+- APNX_firmware.hex — pre-built firmware image for flashing
 
 The exact directory layout may vary depending on the LUFA project setup.
 
@@ -620,7 +622,7 @@ The exact directory layout may vary depending on the LUFA project setup.
 
 ## Build
 
-The firmware is built using the AVR toolchain and the LUFA project configuration.
+The firmware can be built using the AVR toolchain and the provided makefile.
 
 ```bash
 make
