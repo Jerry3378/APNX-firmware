@@ -75,10 +75,15 @@ typedef enum {
     // 0x01xx: 데이터 관련 에러
     ERR_INVALID_DATA_TYPE = 0x0101, // 유효하지 않은 데이터 타입
     ERR_INVALID_COUNT     = 0x0102, // 카운트 범위 초과 (>16)
+	ERR_OUT_OF_RANGE      = 0x0103, // 데이터 범위 초과
     
     // 0x02xx: 주소 관련 에러  
     ERR_INVALID_ADDRESS   = 0x0201, // 주소 범위 초과
-    ERR_OUT_OF_RANGE      = 0x0202, // 데이터 범위 초과
+
+	// 0x03xx: 프레임 검증 에러
+	ERR_INVALID_LEN     = 0x0301,	// 길이 오류
+	ERR_CRC_FAIL        = 0x0302,	// crc 오류
+	ERR_INVALID_STX     = 0x0303,	// stx 오류
     
     // 0xFFxx: 시스템 에러
     ERR_INTERNAL          = 0xFF01, // 내부 에러
@@ -92,7 +97,8 @@ typedef enum {
 	WRITE,
 
 	// 송신 커맨드
-	ACK = 5,
+	ACK_READ = 5,
+	ACK_WRITE,
 	NAK = 15
 } command_t;
 
@@ -114,10 +120,10 @@ typedef enum {
 
 // 프로토콜에서 주소 부분이 사용할 주소 
 struct Address_list {
-	uint8_t input[16];		// (0x100부터 시작 (논리 주소 형태))
-	uint8_t output[16];		// (0x200부터 시작(논리 주소))
+	uint8_t input[16];		// 일단 센서나 무언가 외부로써의 통신을 읽을때 사용(0x100부터 시작 (논리 주소 형태))
+	uint8_t output[16];		// 나가는 공간? 무언가 주소를 통해 나가는 공간 (0x200부터 시작(논리 주소))
 	uint8_t data[64];		// 산술 연산?을 담당하는 변수 (주로 여기서 테스트할 예정) (0x300부터 시작 (논리 주소))
-	uint8_t flag[32];		// (0x400부터 시작 (논리 주소))
+	uint8_t flag[32];		// 상태값(산업에선 설계도에 있는데 잘 모르겠음 예약된 공간) (0x400부터 시작 (논리 주소))
 } memory_map;
 
 
@@ -158,6 +164,7 @@ struct write_ack_packet {
 struct read_ack_packet {
 	struct send_packet_hdr header;
 	uint8_t data_type;
+	uint8_t count;
 	uint8_t payload[1];
 	uint16_t crc;
 }__attribute__((packed));
@@ -176,15 +183,10 @@ struct rx_fsm {
 	int copied_len;
 };
 
-
-// 유틸리티 함수
-
 uint16_t be_to_le16(uint8_t *data) {
-	
-	uint16_t le_data = (*(data+1) << 8) | *data;
-	
-	return le_data;
-} 
+    // [0]이 High, [1]이 Low가 되도록 수정
+    return ((uint16_t)data[0] << 8) | data[1];
+}
 
 uint16_t le_to_be16(uint8_t *data) {
 	
@@ -193,11 +195,13 @@ uint16_t le_to_be16(uint8_t *data) {
 	return be_data;
 } 
 
+// 리틀 엔디안 처럼 인의적으로 데이터를 swap하는게 아닌, 0x12345678을 만들어야함
+// 즉 0x12345678`이라는 숫자 값을 만들어야 Little Endian CPU가 자동으로 `78 56 34 12` 순서로 저장
 uint32_t be_to_le32(uint8_t *data) {
-	return (uint32_t)data[3] << 24 |
-		   (uint32_t)data[2] << 16 |
-		   (uint32_t)data[1] << 8  |
-		   (uint32_t)data[0];
+	return (uint32_t)data[0] << 24 |
+		   (uint32_t)data[1] << 16 |
+		   (uint32_t)data[2] << 8  |
+		   (uint32_t)data[3];
 }
 
 uint32_t le_to_be32(uint8_t *data) {
@@ -211,14 +215,14 @@ uint32_t le_to_be32(uint8_t *data) {
 // 64비트 빅 엔디안 값을 리틀 엔디안으로 변환시키는 함수
 uint64_t be_to_le64(uint8_t *data) {
 
-    return (uint64_t)data[7] << 56 |
-		   (uint64_t)data[6] << 48 |
-		   (uint64_t)data[5] << 40 |
-		   (uint64_t)data[4] << 32 |
-		   (uint64_t)data[3] << 24 |
-		   (uint64_t)data[2] << 16 |
-		   (uint64_t)data[1] << 8  |
-		   (uint64_t)data[0]; 
+    return (uint64_t)data[0] << 56 |
+		   (uint64_t)data[1] << 48 |
+		   (uint64_t)data[2] << 40 |
+		   (uint64_t)data[3] << 32 |
+		   (uint64_t)data[4] << 24 |
+		   (uint64_t)data[5] << 16 |
+		   (uint64_t)data[6] << 8  |
+		   (uint64_t)data[7]; 
 }
 
 uint64_t le_to_be64(uint8_t *data) {
@@ -233,9 +237,16 @@ uint64_t le_to_be64(uint8_t *data) {
 		   (uint64_t)data[0]; 
 }
 
+// 함수 프로토타입 선언 (구조체 정의 다음에 추가)
+static check_result_t check_packet(struct rx_fsm *rx);
+static void parse_packet(struct rx_fsm *rx, struct recived_packet *recv);
+static size_t execute_command(struct recived_packet *recv, uint8_t *tx_buffer);
+static size_t execute_read(struct recived_packet *recv, uint8_t *tx_buffer);
+static size_t execute_write(struct recived_packet *recv, uint8_t *tx_buffer);
+static void jump_to_bootloader(void);		// 부트로더로 가는 함수
+
 // 패킷 처리 관련 함수
 
-// 패킷 파싱하는 함수
 static void parse_packet(struct rx_fsm *rx, struct recived_packet *recv) {
 	uint8_t *buf = rx->buf;
 
@@ -248,6 +259,435 @@ static void parse_packet(struct rx_fsm *rx, struct recived_packet *recv) {
 
 	// payload 부분은 raw데이터의 주소를 저장함(이후에 execute 단계에서 파싱)
 	recv->payload = &buf[7];
+}
+
+
+// 명령 실행 및 응답 생성
+static size_t execute_command(struct recived_packet *recv, uint8_t *tx_buffer) {
+    
+	// read 명령이면
+    if (recv->header.cmd == READ) {
+		return execute_read(recv, tx_buffer);
+	// write 명령이면
+    } else if (recv->header.cmd == WRITE) {
+		return execute_write(recv, tx_buffer);   
+    }
+    
+	return 0;
+}
+
+// 헬퍼 함수들
+
+// CRC 생성(모드버스 방식으로 생성)
+uint16_t calculate_crc(const uint8_t *buf, size_t len)
+{
+    uint16_t crc = 0xFFFF;
+
+    for (size_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x0001)
+                crc = (crc >> 1) ^ 0xA001;
+            else
+                crc >>= 1;
+        }
+    }
+    return crc;
+}
+
+// 응답 전송
+static void send_response(uint8_t *pkt, uint8_t size) {
+    USB_USBTask();
+    
+    Endpoint_SelectEndpoint(VENDOR_IN_EPADDR);
+    
+    // 크기 확인
+    if (size == 0) {
+        // 0바이트 전송 시도! 경고!
+        for(int i=0; i<10; i++) {
+            PORTC ^= (1 << PC7);
+            _delay_ms(50);
+        }
+        return;  // 전송 안 함
+    }
+    
+    uint16_t timeout = 50000;
+    while (!Endpoint_IsINReady() && --timeout) {
+        USB_USBTask();
+    }
+    
+    if (timeout == 0) {
+        // 타임아웃 - LED 계속 켜짐
+        PORTC |= (1 << PC7);
+        return;
+    }
+    
+    Endpoint_Write_Stream_LE(pkt, size, NULL);
+    Endpoint_ClearIN();
+}
+
+// WRITE ACK 생성
+static size_t build_write_ack_packet(uint8_t *tx_buffer, uint8_t cmd_type) {
+    
+	// tx_buffer을 write_ack_packet으로 형변환 시킴
+    struct write_ack_packet *ack = (struct write_ack_packet*)tx_buffer;
+    
+    ack->header.stx = 0x02;
+    ack->header.len = sizeof(struct write_ack_packet);
+    ack->header.id = 0x01;
+    ack->header.cmd = ACK_WRITE;
+    ack->header.cmd_type = cmd_type;
+    
+    // CRC (payload 끝에 추가)
+    uint16_t crc = calculate_crc(tx_buffer, ack->header.len - sizeof(uint16_t));
+    // CRC도 엔디안에 맞게 배치(빅엔디안 형식)
+    tx_buffer[ack->header.len-2] = (uint8_t)(crc >> 8);   // 상위 바이트를 앞 주소에
+    tx_buffer[ack->header.len-1] = (uint8_t)(crc & 0xFF); // 하위 바이트를 뒷 주소에
+    
+    return sizeof(struct write_ack_packet);
+}
+
+// READ ACK 생성
+static size_t build_read_ack_packet(
+    uint8_t *tx_buffer,
+    uint8_t cmd_type,
+    uint8_t data_type,
+    const uint8_t *data,
+    size_t data_size,
+	uint8_t count
+) {
+
+	// tx_buffer에 쓰기 위해서 tx_Buffer을 read_ack_packet으로 형변환(메모리 접근 방식 변경)
+    struct read_ack_packet *ack = (struct read_ack_packet*)tx_buffer;
+    
+    // 전체 크기 계산(header, data_type, count, data_size, crc)
+    size_t total_size = sizeof(struct send_packet_hdr) + 2 + data_size + sizeof(uint16_t);
+    
+    // 헤더
+    ack->header.stx = 0x02;
+    ack->header.len = total_size;
+    ack->header.id = 0x01;
+    ack->header.cmd = ACK_READ;
+    ack->header.cmd_type = cmd_type;
+    
+    // 데이터 타입
+    ack->data_type = data_type;
+
+	// count 데이터 갯수
+	ack->count = count;
+    
+    // 페이로드 복사
+    memcpy(ack->payload, data, data_size);
+    
+    // CRC (payload 끝에 추가)
+    uint16_t crc = calculate_crc(tx_buffer, total_size - sizeof(uint16_t));
+    // CRC도 엔디안에 맞게 배치(빅엔디안 형식)
+    tx_buffer[total_size-2] = (uint8_t)(crc >> 8);   // 상위 바이트를 앞 주소에
+    tx_buffer[total_size-1] = (uint8_t)(crc & 0xFF); // 하위 바이트를 뒷 주소에
+
+    return total_size;
+}
+
+
+// NAK 생성
+static size_t build_nak_packet(uint8_t *tx_buffer, uint8_t cmd_type, error_code_t error_code) {
+    
+	// tx_buffer을 send_nak_packet*으로 형변환 하여 접근
+	// 캐스팅으로 단지 해석하는 방법만 달리하여 접근
+	struct nak_packet *nak = (struct nak_packet*)tx_buffer;
+
+    nak->header.stx = 0x02;
+    nak->header.len = sizeof(struct nak_packet);
+    nak->header.id = 0x01;
+    nak->header.cmd = NAK;
+    nak->header.cmd_type = cmd_type;
+    
+	// 에러코드도 16비트이므로 보낼땐 빅엔디안으로 조정을 시켜줘야함
+	uint16_t error = (uint16_t)error_code;
+	tx_buffer[nak->header.len-4] = (uint8_t)(error >> 8);   // 상위 바이트를 앞 주소에
+	tx_buffer[nak->header.len-3] = (uint8_t)(error & 0xFF);   // 상위 바이트를 앞 주소에
+
+	// CRC (payload 끝에 추가)
+    uint16_t crc = calculate_crc(tx_buffer, nak->header.len - sizeof(uint16_t));
+    // CRC도 엔디안에 맞게 배치(빅엔디안 형식)
+    tx_buffer[nak->header.len-2] = (uint8_t)(crc >> 8);   // 상위 바이트를 앞 주소에
+    tx_buffer[nak->header.len-1] = (uint8_t)(crc & 0xFF); // 하위 바이트를 뒷 주소에
+    
+    return sizeof(struct nak_packet);
+}
+
+
+// 비정상 요청에 대한 응답을 보내는 함수
+static void generate_error_response(uint8_t *tx_buffer, check_result_t error_type, uint8_t cmd_type) {
+	
+	switch (error_type)
+	{
+	case CHECK_ERR_CMD:
+		build_nak_packet(tx_buffer, cmd_type, ERR_INVALID_CMD);
+		break;
+	case CHECK_ERR_COUNT:
+		build_nak_packet(tx_buffer, cmd_type, ERR_INVALID_COUNT);
+		break;
+	case CHECK_ERR_CMD_TYPE:
+		build_nak_packet(tx_buffer, cmd_type, ERR_INVALID_CMD_TYPE);
+		break;
+	case CHECK_ERR_DATA_TYPE:
+		build_nak_packet(tx_buffer, cmd_type, ERR_INVALID_DATA_TYPE);
+		break;
+	case CHECK_ERR_ADDRESS:
+		build_nak_packet(tx_buffer, cmd_type, ERR_INVALID_ADDRESS);
+		break;
+	default:
+		break;
+	}
+}
+
+/** Main program entry point. This routine configures the hardware required by the application, then
+ *  enters a loop to run the application tasks in sequence.
+ */
+int main(void)
+{
+	SetupHardware();
+
+	LEDs_SetAllLEDs(LEDMASK_USB_NOTREADY);
+	GlobalInterruptEnable();
+
+	check_result_t retval = CHECK_OK;
+
+	struct rx_fsm rx = {
+        .expected_len = 0,
+        .copied_len = 0
+    };
+
+	for (;;)
+	{
+		USB_USBTask();
+
+		// 쓸 데이터 설정
+		uint8_t tx_buffer[256];
+		memset(&tx_buffer, 0x00, sizeof(tx_buffer));
+
+		// 받을 데이터 설정
+		uint8_t ReceivedData[VENDOR_IO_EPSIZE];
+		memset(&ReceivedData, 0x00, sizeof(ReceivedData));
+
+		Endpoint_SelectEndpoint(VENDOR_OUT_EPADDR);
+		if (Endpoint_IsOUTReceived())
+		{
+			uint16_t rx_len = Endpoint_BytesInEndpoint();  // 실제 받은 바이트 수
+
+			// 빈 패킷 무시
+			if (rx_len == 0) {
+				Endpoint_ClearOUT();
+				continue;
+			}
+			
+			Endpoint_Read_Stream_LE(ReceivedData, rx_len, NULL);	// 여기서 받은 바이트 만큼 little endian으로 읽는 것임
+			Endpoint_ClearOUT();	// 엔드포인트 닫음
+			
+			// 첫 수신: 예상 길이 파싱 및 검증
+        	if (rx.copied_len == 0) {
+				if (rx_len < 2) {
+					// 헤더도 안 왔음 - 에러 처리
+					continue;
+				}
+				
+				rx.expected_len = ReceivedData[1];
+				
+				// 길이 검증 (버퍼 크기 확인)
+				if (rx.expected_len > MAX_PACKET_LEN) {
+					// 에러: 버퍼 초과
+					build_nak_packet(tx_buffer, 0x00, ERR_INVALID_LEN);
+					rx.copied_len = 0;  // 리셋
+					send_response(tx_buffer, sizeof(struct nak_packet));
+					continue;
+				}
+        	}
+
+			// 버퍼 오버플로우 방지
+			if (rx.copied_len + rx_len > MAX_PACKET_LEN) {
+				// 에러 처리 후 리셋
+				rx.copied_len = 0;
+				rx.expected_len = 0;
+				continue;
+			}
+
+			// CRC 검증
+            if (rx.copied_len + rx_len >= rx.expected_len) {
+
+                // 우선 데이터 먼저 복사
+                memcpy(rx.buf + rx.copied_len, ReceivedData, rx_len);
+                rx.copied_len += rx_len;
+
+                if (rx.copied_len == rx.expected_len) {
+
+                    // STX 확인 
+                    if (rx.buf[0] != 0x02) {
+                        build_nak_packet(tx_buffer, 0x00, ERR_INVALID_STX);
+                        send_response(tx_buffer, sizeof(struct nak_packet));
+                        rx.copied_len = 0;
+                        rx.expected_len = 0;
+                        continue;
+                    }
+
+                    // 최소 길이 확인 (STX + LEN + CRC 포함 최소 구조)
+                    if (rx.expected_len < 8) {
+                        build_nak_packet(tx_buffer, 0x00, ERR_INVALID_LEN);
+                        send_response(tx_buffer, sizeof(struct nak_packet));
+                        rx.copied_len = 0;
+                        rx.expected_len = 0;
+                        continue;
+                    }
+
+                    // 수신된 CRC 추출 (마지막 2바이트 Big Endian)
+                    uint16_t received_crc =
+                        ((uint16_t)rx.buf[rx.expected_len - 2] << 8) |
+                         rx.buf[rx.expected_len - 1];
+
+                    // CRC 계산 (CRC 필드 제외)
+                    uint16_t calculated_crc =
+                        calculate_crc(rx.buf, rx.expected_len - 2);
+
+                    if (received_crc != calculated_crc) {
+                        build_nak_packet(tx_buffer, 0x00, ERR_CRC_FAIL);
+                        send_response(tx_buffer, sizeof(struct nak_packet));
+                        rx.copied_len = 0;
+                        rx.expected_len = 0;
+                        continue;
+                    }
+
+                }
+
+            } else {
+                // 아직 프레임이 덜 왔으면 일단 복사만
+                memcpy(rx.buf + rx.copied_len, ReceivedData, rx_len);
+                rx.copied_len += rx_len;
+                continue;
+            }
+
+			if (rx.copied_len >= rx.expected_len) 		
+            	retval = check_packet(&rx);		// 패킷 검증
+			
+			if (retval == CHECK_GO_TO_BOOT)
+				jump_to_bootloader();
+
+			if (retval != CHECK_OK) {
+				uint8_t cmd_type = rx.buf[4];
+
+				generate_error_response(tx_buffer,retval, cmd_type);
+				rx.copied_len = 0;
+				rx.expected_len = 0;
+				send_response(tx_buffer, sizeof(struct nak_packet));
+				continue;
+			}
+			// 정상적인 패킷이면 여기서 파싱
+			struct recived_packet recv;
+			parse_packet(&rx, &recv);
+
+			size_t tx_size = execute_command(&recv, tx_buffer);
+
+			if (tx_size > 0) {
+				send_response(tx_buffer, tx_size);
+			}
+
+			rx.copied_len = 0;
+			rx.expected_len = 0;
+		}
+	}
+}
+
+/** Configures the board hardware and chip peripherals for the demo's functionality. */
+void SetupHardware(void)
+{
+#if (ARCH == ARCH_AVR8)
+	/* Disable watchdog if enabled by bootloader/fuses */
+	MCUSR &= ~(1 << WDRF);
+	wdt_disable();
+
+	/* Disable clock division */
+	clock_prescale_set(clock_div_1);
+#elif (ARCH == ARCH_XMEGA)
+	/* Start the PLL to multiply the 2MHz RC oscillator to 32MHz and switch the CPU core to run from it */
+	XMEGACLK_StartPLL(CLOCK_SRC_INT_RC2MHZ, 2000000, F_CPU);
+	XMEGACLK_SetCPUClockSource(CLOCK_SRC_PLL);
+
+	/* Start the 32MHz internal RC oscillator and start the DFLL to increase it to 48MHz using the USB SOF as a reference */
+	XMEGACLK_StartInternalOscillator(CLOCK_SRC_INT_RC32MHZ);
+	XMEGACLK_StartDFLL(CLOCK_SRC_INT_RC32MHZ, DFLL_REF_INT_USBSOF, F_USB);
+
+	PMIC.CTRL = PMIC_LOLVLEN_bm | PMIC_MEDLVLEN_bm | PMIC_HILVLEN_bm;
+#endif
+
+	/* Hardware Initialization */
+	LEDs_Init();
+	USB_Init();
+}
+
+/** Event handler for the USB_Connect event. This indicates that the device is enumerating via the status LEDs. */
+void EVENT_USB_Device_Connect(void)
+{
+	/* Indicate USB enumerating */
+	LEDs_SetAllLEDs(LEDMASK_USB_ENUMERATING);
+}
+
+/** Event handler for the USB_Disconnect event. This indicates that the device is no longer connected to a host via
+ *  the status LEDs.
+ */
+void EVENT_USB_Device_Disconnect(void)
+{
+	/* Indicate USB not ready */
+	LEDs_SetAllLEDs(LEDMASK_USB_NOTREADY);
+}
+
+/** Event handler for the USB_ConfigurationChanged event. This is fired when the host set the current configuration
+ *  of the USB device after enumeration - the device endpoints are configured.
+ */
+void EVENT_USB_Device_ConfigurationChanged(void)
+{
+	bool ConfigSuccess = true;
+
+	/* Setup Vendor Data Endpoints */
+	ConfigSuccess &= Endpoint_ConfigureEndpoint(VENDOR_IN_EPADDR,  EP_TYPE_BULK, VENDOR_IO_EPSIZE, 1);
+	ConfigSuccess &= Endpoint_ConfigureEndpoint(VENDOR_OUT_EPADDR, EP_TYPE_BULK, VENDOR_IO_EPSIZE, 1);
+
+	/* Indicate endpoint configuration success or failure */
+	LEDs_SetAllLEDs(ConfigSuccess ? LEDMASK_USB_READY : LEDMASK_USB_ERROR);
+}
+
+/** Event handler for the USB_ControlRequest event. This is used to catch and process control requests sent to
+ *  the device from the USB host before passing along unhandled control requests to the library for processing
+ *  internally.
+ */
+void EVENT_USB_Device_ControlRequest(void)
+{
+	// Process vendor specific control requests here
+}
+
+
+// usb를 통해 펌웨어를 올려야할때(avrdude) 사용하는 부트로더로 진입하는 창구입니다.
+void jump_to_bootloader(void) {
+	
+	cli();		// 이후 모든 인터럽트를 막음, USB ISR이 중간에 개입하면, WDT 전에 다른 코드가 실행될 수 있음
+
+	// boot address key를 불러옴
+	volatile uint16_t* boot_key_address = (volatile uint16_t*)BOOT_KEY_ADDR;
+	
+	// boot key address에 부트 키 값을 덮어씌웁니다.
+	*boot_key_address = BOOT_KEY;
+
+	// 2. LED 3번 깜빡임
+    for(int i=0; i<3; i++) {
+        PORTC |= (1 << PC7); // LED ON
+        _delay_ms(50);
+        PORTC &= ~(1 << PC7); // LED OFF
+        _delay_ms(50);
+    }
+
+	USB_Disable();		// usb연결을 해제함(usb가 사라짐)
+
+	wdt_enable(WDTO_120MS);		// 120MS후 리셋
+
+	for(;;);			// watchdog 리셋 대기
 }
 
 // command가 유효한지 확인하는 함수
@@ -382,161 +822,6 @@ static check_result_t check_packet(struct rx_fsm *rx) {
     }
     
     return CHECK_OK;
-}
-
-// 명령 실행 및 응답 생성
-static size_t execute_command(struct recived_packet *recv, uint8_t *tx_buffer) {
-    
-	// read 명령이면
-    if (recv->header.cmd == READ) {
-		return execute_read(recv, tx_buffer);
-	// write 명령이면
-    } else if (recv->header.cmd == WRITE) {
-		return execute_write(recv, tx_buffer);   
-    }
-    
-	return 0;
-}
-
-
-// 받은 프로토콜을 검증하는 함수
-static int check_packet(struct rx_fsm *rx);
-
-// 헬퍼 함수들
-
-// CRC 생성(모드버스 방식으로 생성)
-uint16_t calculate_crc(const uint8_t *buf, size_t len)
-{
-    uint16_t crc = 0xFFFF;
-
-    for (size_t i = 0; i < len; i++) {
-        crc ^= buf[i];
-        for (int j = 0; j < 8; j++) {
-            if (crc & 0x0001)
-                crc = (crc >> 1) ^ 0xA001;
-            else
-                crc >>= 1;
-        }
-    }
-    return crc;
-}
-
-// 응답 전송
-static void send_response(uint8_t *pkt) {
-    Endpoint_SelectEndpoint(VENDOR_IN_EPADDR);
-    Endpoint_Write_Stream_LE(pkt, sizeof(*pkt), NULL);
-    Endpoint_ClearIN();
-}
-
-
-// WRITE ACK 생성
-static size_t build_write_ack_packet(uint8_t *tx_buffer, uint8_t cmd_type) {
-    
-	// tx_buffer을 write_ack_packet으로 형변환 시킴
-    struct write_ack_packet *ack = (struct write_ack_packet*)tx_buffer;
-    
-    ack->header.stx = 0x02;
-    ack->header.len = sizeof(struct write_ack_packet);
-    ack->header.id = 0x01;
-    ack->header.cmd = ACK;
-    ack->header.cmd_type = cmd_type;
-    
-    // CRC (payload 끝에 추가)
-    uint16_t crc = calculate_crc(tx_buffer, ack->header.len - sizeof(uint16_t));
-    // CRC도 엔디안에 맞게 배치(빅엔디안 형식)
-    tx_buffer[ack->header.len-2] = (uint8_t)(crc >> 8);   // 상위 바이트를 앞 주소에
-    tx_buffer[ack->header.len-1] = (uint8_t)(crc & 0xFF); // 하위 바이트를 뒷 주소에
-    
-    return sizeof(struct write_ack_packet);
-}
-
-// READ ACK 생성
-static size_t build_read_ack_packet(
-    uint8_t *tx_buffer, 
-    uint8_t cmd_type,
-    uint8_t data_type,
-    const uint8_t *data,
-    size_t data_size,
-	uint8_t count
-) {
-
-	// tx_buffer에 쓰기 위해서 tx_Buffer을 read_ack_packet으로 형변환(메모리 접근 방식 변경)
-    struct read_ack_packet *ack = (struct read_ack_packet*)tx_buffer;
-    
-    // 전체 크기 계산
-    size_t total_size = sizeof(struct send_packet_hdr) + 1 + data_size + sizeof(uint16_t);
-    
-    // 헤더
-    ack->header.stx = 0x02;
-    ack->header.len = total_size;
-    ack->header.id = 0x01;
-    ack->header.cmd = ACK;
-    ack->header.cmd_type = cmd_type;
-    
-    // 데이터 타입
-    ack->data_type = data_type;
-	ack->count = count;
-    
-    // 페이로드 복사
-    memcpy(ack->payload, data, data_size);
-    
-    // CRC (payload 끝에 추가)
-    uint16_t crc = calculate_crc(tx_buffer, total_size - sizeof(uint16_t));
-    // CRC도 엔디안에 맞게 배치(빅엔디안 형식)
-    tx_buffer[total_size-2] = (uint8_t)(crc >> 8);   // 상위 바이트를 앞 주소에
-    tx_buffer[total_size-1] = (uint8_t)(crc & 0xFF); // 하위 바이트를 뒷 주소에
-
-    return total_size;
-}
-
-
-// NAK 생성
-static size_t build_nak_packet(uint8_t *tx_buffer, uint8_t cmd_type, error_code_t error_code) {
-    
-	// tx_buffer을 send_nak_packet*으로 형변환 하여 접근
-	// 캐스팅으로 단지 해석하는 방법만 달리하여 접근
-	struct nak_packet *nak = (struct nak_packet*)tx_buffer;
-
-    nak->header.stx = 0x02;
-    nak->header.len = sizeof(struct nak_packet);
-    nak->header.id = 0x01;
-    nak->header.cmd = NAK;
-    nak->header.cmd_type = cmd_type;
-    nak->error_code = error_code;
-
-	// CRC (payload 끝에 추가)
-    uint16_t crc = calculate_crc(tx_buffer, nak->header.len - sizeof(uint16_t));
-    // CRC도 엔디안에 맞게 배치(빅엔디안 형식)
-    tx_buffer[nak->header.len-2] = (uint8_t)(crc >> 8);   // 상위 바이트를 앞 주소에
-    tx_buffer[nak->header.len-1] = (uint8_t)(crc & 0xFF); // 하위 바이트를 뒷 주소에
-    
-    return sizeof(struct nak_packet);
-}
-
-
-// 비정상 요청에 대한 응답을 보내는 함수
-static void generate_error_response(uint8_t *tx_buffer, check_result_t error_type, uint8_t cmd_type) {
-	
-	switch (error_type)
-	{
-	case CHECK_ERR_CMD:
-		build_nak_packet(tx_buffer, cmd_type, ERR_INVALID_CMD);
-		break;
-	case CHECK_ERR_COUNT:
-		build_nak_packet(tx_buffer, cmd_type, ERR_INVALID_COUNT);
-		break;
-	case CHECK_ERR_CMD_TYPE:
-		build_nak_packet(tx_buffer, cmd_type, ERR_INVALID_CMD_TYPE);
-		break;
-	case CHECK_ERR_DATA_TYPE:
-		build_nak_packet(tx_buffer, cmd_type, ERR_INVALID_DATA_TYPE);
-		break;
-	case CHECK_ERR_ADDRESS:
-		build_nak_packet(tx_buffer, cmd_type, ERR_INVALID_ADDRESS);
-		break;
-	default:
-		break;
-	}
 }
 
 // 내부 연산 처리용 함수
@@ -709,200 +994,4 @@ static size_t execute_write(struct recived_packet *recv, uint8_t *tx_buffer) {
     }
     
     return build_write_ack_packet(tx_buffer, recv->header.cmd_type);  // WRITE는 cmd_type만 있으면 됨
-}
-
-
-/** Main program entry point. This routine configures the hardware required by the application, then
- *  enters a loop to run the application tasks in sequence.
- */
-int main(void)
-{
-	SetupHardware();
-
-	LEDs_SetAllLEDs(LEDMASK_USB_NOTREADY);
-	GlobalInterruptEnable();
-
-	check_result_t retval = CHECK_OK;
-
-	struct rx_fsm rx = {
-        .state = CHECK_OK,
-        .expected_len = 0,
-        .copied_len = 0
-    };
-
-	for (;;)
-	{
-		USB_USBTask();
-
-		// 쓸 데이터 설정
-		uint8_t tx_buffer[256];
-		memset(&tx_buffer, 0x00, sizeof(tx_buffer));
-
-		// 받을 데이터 설정
-		uint8_t ReceivedData[VENDOR_IO_EPSIZE];
-		memset(&ReceivedData, 0x00, sizeof(ReceivedData));
-
-		Endpoint_SelectEndpoint(VENDOR_OUT_EPADDR);
-		if (Endpoint_IsOUTReceived())
-		{
-			uint16_t rx_len = Endpoint_BytesInEndpoint();  // 실제 받은 바이트 수
-
-			// 빈 패킷 무시
-			if (rx_len == 0) {
-				Endpoint_ClearOUT();
-				continue;
-			}
-			
-			Endpoint_Read_Stream_LE(ReceivedData, rx_len, NULL);	// 여기서 받은 바이트 만큼 little endian으로 읽는 것임
-			Endpoint_ClearOUT();	// 엔드포인트 닫음
-			
-			// 첫 수신: 예상 길이 파싱 및 검증
-        	if (rx.copied_len == 0) {
-				if (rx_len < 2) {
-					// 헤더도 안 왔음 - 에러 처리
-					continue;
-				}
-				
-				rx.expected_len = ReceivedData[1];
-				
-				// 길이 검증 (버퍼 크기 확인)
-				if (rx.expected_len > MAX_PACKET_LEN) {
-					// 에러: 버퍼 초과
-					rx.copied_len = 0;  // 리셋
-					continue;
-				}
-        	}
-
-			// 버퍼 오버플로우 방지
-			if (rx.copied_len + rx_len > MAX_PACKET_LEN) {
-				// 에러 처리 후 리셋
-				rx.copied_len = 0;
-				rx.expected_len = 0;
-				continue;
-			}
-
-			// 데이터 복사
-			memcpy(rx.buf + rx.copied_len, ReceivedData, rx_len);
-			rx.copied_len += rx_len;
-
-			if (rx.copied_len >= rx.expected_len) 		
-            	retval = check_packet(&rx);		// 패킷 검증
-			
-			if (retval != CHECK_OK) {
-				uint8_t cmd_type = rx.buf[4];
-
-				generate_error_response(tx_buffer,retval, cmd_type);
-				rx.copied_len = 0;
-				rx.expected_len = 0;
-				send_response(tx_buffer);
-				continue;
-			}
-			// 정상적인 패킷이면 여기서 파싱
-			struct recived_packet recv;
-			parse_packet(&rx, &recv);
-
-			size_t tx_size = execute_command(&recv, tx_buffer);
-
-			if (tx_size > 0) {
-				send_response(tx_buffer);
-			}
-
-			rx.copied_len = 0;
-			rx.expected_len = 0;
-		}
-	}
-}
-
-/** Configures the board hardware and chip peripherals for the demo's functionality. */
-void SetupHardware(void)
-{
-#if (ARCH == ARCH_AVR8)
-	/* Disable watchdog if enabled by bootloader/fuses */
-	MCUSR &= ~(1 << WDRF);
-	wdt_disable();
-
-	/* Disable clock division */
-	clock_prescale_set(clock_div_1);
-#elif (ARCH == ARCH_XMEGA)
-	/* Start the PLL to multiply the 2MHz RC oscillator to 32MHz and switch the CPU core to run from it */
-	XMEGACLK_StartPLL(CLOCK_SRC_INT_RC2MHZ, 2000000, F_CPU);
-	XMEGACLK_SetCPUClockSource(CLOCK_SRC_PLL);
-
-	/* Start the 32MHz internal RC oscillator and start the DFLL to increase it to 48MHz using the USB SOF as a reference */
-	XMEGACLK_StartInternalOscillator(CLOCK_SRC_INT_RC32MHZ);
-	XMEGACLK_StartDFLL(CLOCK_SRC_INT_RC32MHZ, DFLL_REF_INT_USBSOF, F_USB);
-
-	PMIC.CTRL = PMIC_LOLVLEN_bm | PMIC_MEDLVLEN_bm | PMIC_HILVLEN_bm;
-#endif
-
-	/* Hardware Initialization */
-	LEDs_Init();
-	USB_Init();
-}
-
-/** Event handler for the USB_Connect event. This indicates that the device is enumerating via the status LEDs. */
-void EVENT_USB_Device_Connect(void)
-{
-	/* Indicate USB enumerating */
-	LEDs_SetAllLEDs(LEDMASK_USB_ENUMERATING);
-}
-
-/** Event handler for the USB_Disconnect event. This indicates that the device is no longer connected to a host via
- *  the status LEDs.
- */
-void EVENT_USB_Device_Disconnect(void)
-{
-	/* Indicate USB not ready */
-	LEDs_SetAllLEDs(LEDMASK_USB_NOTREADY);
-}
-
-/** Event handler for the USB_ConfigurationChanged event. This is fired when the host set the current configuration
- *  of the USB device after enumeration - the device endpoints are configured.
- */
-void EVENT_USB_Device_ConfigurationChanged(void)
-{
-	bool ConfigSuccess = true;
-
-	/* Setup Vendor Data Endpoints */
-	ConfigSuccess &= Endpoint_ConfigureEndpoint(VENDOR_IN_EPADDR,  EP_TYPE_BULK, VENDOR_IO_EPSIZE, 1);
-	ConfigSuccess &= Endpoint_ConfigureEndpoint(VENDOR_OUT_EPADDR, EP_TYPE_BULK, VENDOR_IO_EPSIZE, 1);
-
-	/* Indicate endpoint configuration success or failure */
-	LEDs_SetAllLEDs(ConfigSuccess ? LEDMASK_USB_READY : LEDMASK_USB_ERROR);
-}
-
-/** Event handler for the USB_ControlRequest event. This is used to catch and process control requests sent to
- *  the device from the USB host before passing along unhandled control requests to the library for processing
- *  internally.
- */
-void EVENT_USB_Device_ControlRequest(void)
-{
-	// Process vendor specific control requests here
-}
-
-
-// usb를 통해 펌웨어를 올려야할때(avrdude) 사용하는 부트로더로 진입하는 창구입니다.
-void jump_to_bootloader(void) {
-	
-	cli();		// 이후 모든 인터럽트를 막음, USB ISR이 중간에 개입하면, WDT 전에 다른 코드가 실행될 수 있음
-
-	// boot address key를 불러옴
-	volatile uint16_t* boot_key_address = (volatile uint16_t*)BOOT_KEY_ADDR;
-	
-	// boot key address에 부트 키 값을 덮어씌웁니다.
-	*boot_key_address = BOOT_KEY;
-
-	// 2. LED 3번 깜빡임
-    for(int i=0; i<3; i++) {
-        PORTC |= (1 << PC7); // LED ON
-        _delay_ms(50);
-        PORTC &= ~(1 << PC7); // LED OFF
-        _delay_ms(50);
-    }
-
-	USB_Disable();		// usb연결을 해제함(usb가 사라짐)
-
-	wdt_enable(WDTO_120MS);		// 120MS후 리셋
-
-	for(;;);			// watchdog 리셋 대기
 }
